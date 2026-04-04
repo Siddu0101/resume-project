@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect } from "react";
+import LoginPage from './LoginPage.jsx';
+import { supabase, loadUserProgress, saveUserProgress } from './supabase.js';
 
 // ══════════════════════════════════════════════
 //  THEME
@@ -1396,22 +1398,106 @@ const Dashboard = ({ setActive }) => {
 };
 
 // ══════════════════════════════════════════════════════════════════
-//  ROOT APP
-// ══════════════════════════════════════════════════════════════════
-
-// ══════════════════════════════════════════════════════════════════
-//  ROOT APP
+//  ROOT APP  (with Supabase Auth + progress persistence)
 // ══════════════════════════════════════════════════════════════════
 export default function App() {
-  const [apiKey, setApiKey] = useState('');
-  const [page, setPage]   = useState('dashboard');
-  const [learningData, setLearningData] = useState(null);
+  /* ── Auth state ── */
+  const [authChecked, setAuthChecked] = useState(false); // true once we know if logged in
+  const [user,        setUser]        = useState(null);
+  const [session,     setSession]     = useState(null);
+
+  /* ── App state ── */
+  const [apiKey,       setApiKey]      = useState('');
+  const [page,         setPage]        = useState('dashboard');
+  const [learningData, setLearningData]= useState(null);
+  const [progressLoaded, setProgressLoaded] = useState(false);
+
+  /* ── On mount: restore existing Supabase session ── */
+  useEffect(() => {
+    // 1. Check current session (handles OAuth/magic-link redirects too)
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      if (s) {
+        setSession(s);
+        setUser(s.user);
+      }
+      setAuthChecked(true);
+    });
+
+    // 2. Listen for future auth changes (sign-in, sign-out, token refresh)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, s) => {
+      setSession(s);
+      setUser(s?.user ?? null);
+      if (!s) {
+        // Signed out — clear all local state
+        setApiKey('');
+        setPage('dashboard');
+        setLearningData(null);
+        setProgressLoaded(false);
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  /* ── When user is authenticated, load their saved progress ── */
+  useEffect(() => {
+    if (!user || progressLoaded) return;
+    (async () => {
+      const progress = await loadUserProgress(user.id);
+      if (progress?.gemini_api_key) setApiKey(progress.gemini_api_key);
+      if (progress?.learning_data)  setLearningData(progress.learning_data);
+      setProgressLoaded(true);
+    })();
+  }, [user, progressLoaded]);
+
+  /* ── Save API key to Supabase whenever it changes ── */
+  useEffect(() => {
+    if (!user || !apiKey || !progressLoaded) return;
+    saveUserProgress(user.id, { gemini_api_key: apiKey });
+  }, [apiKey, user, progressLoaded]);
+
+  /* ── Save learning data to Supabase whenever it changes ── */
+  useEffect(() => {
+    if (!user || !learningData || !progressLoaded) return;
+    saveUserProgress(user.id, { learning_data: learningData });
+  }, [learningData, user, progressLoaded]);
 
   const handleRedirectToLearning = data => {
     setLearningData(data);
     setPage('learning');
   };
 
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+  };
+
+  /* ── Step 1: Wait for session check ── */
+  if (!authChecked) {
+    return (
+      <div style={{
+        minHeight: '100vh', display: 'flex', alignItems: 'center',
+        justifyContent: 'center', background: C.bg,
+        fontFamily: "'Source Sans 3', sans-serif",
+      }}>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{
+            width: 48, height: 48, borderRadius: '50%',
+            border: `4px solid ${C.bluePale}`, borderTopColor: C.blue,
+            animation: 'spin .8s linear infinite', margin: '0 auto 16px',
+          }} />
+          <p style={{ color: C.muted, fontSize: 14 }}>Loading Career-Copilot AI…</p>
+        </div>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
+
+  /* ── Step 2: Not logged in → show Login page ── */
+  if (!user) {
+    return <LoginPage onAuthenticated={(u, s) => { setUser(u); setSession(s); }} />;
+  }
+
+  /* ── Step 3: Logged in but no Gemini API key yet → ApiKeySetup ── */
   if (!apiKey) return (
     <>
       <style>{`
@@ -1422,10 +1508,18 @@ export default function App() {
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
         input:focus, textarea:focus { border-color: ${C.blue} !important; box-shadow: 0 0 0 3px rgba(21,84,173,.12) !important; }
       `}</style>
+      {/* Small sign-out link at top */}
+      <div style={{ position: 'fixed', top: 16, right: 24, zIndex: 999 }}>
+        <button onClick={handleSignOut}
+          style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>
+          Sign out ↗
+        </button>
+      </div>
       <ApiKeySetup onSave={setApiKey} />
     </>
   );
 
+  /* ── Step 4: Fully authenticated + API key → Main app ── */
   return (
     <>
       <style>{`
@@ -1442,12 +1536,46 @@ export default function App() {
 
       <div style={{ display: 'flex', minHeight: '100vh', background: C.bg, fontFamily: "'Source Sans 3', sans-serif" }}>
         <Sidebar active={page} setActive={setPage} />
-        <main style={{ flex: 1, padding: 32, overflowY: 'auto', maxHeight: '100vh' }}>
-          {page === 'dashboard' && <Dashboard setActive={setPage} />}
-          {page === 'resume'    && <ResumeAnalyzer apiKey={apiKey} onRedirectToLearning={handleRedirectToLearning} />}
-          {page === 'learning'  && <LearningPath apiKey={apiKey} targetData={learningData} />}
-          {page === 'interview' && <InterviewAgent apiKey={apiKey} />}
-        </main>
+
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          {/* ── Top bar with user info + sign out ── */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'flex-end',
+            padding: '12px 32px', background: C.white,
+            borderBottom: `1px solid ${C.border}`, gap: 14, flexShrink: 0,
+          }}>
+            <div style={{
+              width: 34, height: 34, borderRadius: '50%',
+              background: C.navy, color: '#fff',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontWeight: 700, fontSize: 14,
+            }}>
+              {(user.user_metadata?.full_name || user.email || 'U')[0].toUpperCase()}
+            </div>
+            <div style={{ lineHeight: 1.3 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: C.dark }}>
+                {user.user_metadata?.full_name || 'User'}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted }}>{user.email}</div>
+            </div>
+            <button onClick={handleSignOut}
+              style={{
+                background: C.redBg, color: C.red, border: 'none', borderRadius: 8,
+                padding: '6px 14px', fontSize: 12, fontWeight: 700,
+                cursor: 'pointer', fontFamily: 'inherit',
+              }}>
+              Sign Out
+            </button>
+          </div>
+
+          <main style={{ flex: 1, padding: 32, overflowY: 'auto', maxHeight: 'calc(100vh - 60px)' }}>
+            {page === 'dashboard' && <Dashboard setActive={setPage} />}
+            {page === 'resume'    && <ResumeAnalyzer apiKey={apiKey} onRedirectToLearning={handleRedirectToLearning} />}
+            {page === 'learning'  && <LearningPath apiKey={apiKey} targetData={learningData} />}
+            {page === 'interview' && <InterviewAgent apiKey={apiKey} />}
+          </main>
+        </div>
+
         <FloatingChatbot apiKey={apiKey} />
       </div>
     </>
